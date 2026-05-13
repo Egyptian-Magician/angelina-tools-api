@@ -1,7 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
-duckduckgo-search==6.3.7
 twilio==9.4.0
 supabase==2.10.0
 cachetools==5.5.0

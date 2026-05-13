@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -102,24 +103,33 @@ async def web_search(request: WebSearchRequest):
             logger.info("cache hit: %s", cache_key)
             return _search_cache[cache_key]
 
-    def _run_ddg():
-        from duckduckgo_search import DDGS
-        snippets = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(request.query, max_results=request.max_results or 3):
-                body = r.get("body", "").strip()
-                if body:
-                    snippets.append(body)
-        return snippets
-
     try:
-        snippets = await asyncio.to_thread(_run_ddg)
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q": request.query,
+                    "format": "json",
+                    "no_html": "1",
+                    "skip_disambig": "1",
+                    "t": "angelina-assistant",
+                },
+            )
+            data = resp.json()
+
+        snippets = []
+        if data.get("Answer"):
+            snippets.append(data["Answer"])
+        if data.get("AbstractText"):
+            snippets.append(data["AbstractText"])
+        for topic in data.get("RelatedTopics", [])[:2]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                snippets.append(topic["Text"])
 
         if not snippets:
             response = {"result": "I searched but didn't find anything specific on that. What else can I help with?"}
         else:
             combined = " ".join(snippets)
-            # Keep it speakable — trim at word boundary around 400 chars
             if len(combined) > 400:
                 combined = combined[:400].rsplit(" ", 1)[0] + "."
             response = {"result": combined}
@@ -169,7 +179,6 @@ async def send_sms(request: SMSRequest):
 async def send_email(request: EmailRequest):
     try:
         if RESEND_API_KEY:
-            import httpx
             async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.post(
                     "https://api.resend.com/emails",
