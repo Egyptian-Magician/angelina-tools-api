@@ -4,5 +4,5 @@ pydantic==2.10.3
 twilio==9.4.0
 supabase==2.10.0
 cachetools==5.5.0
-httpx>=0.26.0,<0.28.0
+httpx>=0.26.0
 python-dotenv==1.0.1
