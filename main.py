@@ -44,8 +44,11 @@ def _get_twilio():
 def _get_supabase():
     global _supabase
     if _supabase is None and SUPABASE_URL and SUPABASE_KEY:
-        from supabase import create_client
-        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        try:
+            from supabase import create_client
+            _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            logger.error("supabase init error: %s", e)
     return _supabase
 
 
@@ -152,6 +155,14 @@ async def sms_inbound(
     if not user_message:
         return _twiml("Hi! This is Angelina. How can I help you today?")
 
+    try:
+        return await _handle_sms(from_number, user_message)
+    except Exception as e:
+        logger.error("sms_inbound unhandled error: %s", e, exc_info=True)
+        return _twiml("Sorry, something went wrong on my end. Please try again or call us directly.")
+
+
+async def _handle_sms(from_number: str, user_message: str) -> Response:
     # Load conversation history from Supabase
     history: list = []
     conv_id: Optional[str] = None
