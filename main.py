@@ -141,6 +141,22 @@ async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/debug/claude-test")
+async def claude_test():
+    client = _get_anthropic()
+    if not client:
+        return {"error": "anthropic client not initialised — check ANTHROPIC_API_KEY"}
+    try:
+        resp = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=60,
+            messages=[{"role": "user", "content": "Reply with exactly: working"}],
+        )
+        return {"reply": resp.content[0].text, "model": resp.model}
+    except Exception as e:
+        return {"error": str(e), "error_type": type(e).__name__}
+
+
 @app.get("/debug/status")
 async def debug_status():
     import importlib.util
