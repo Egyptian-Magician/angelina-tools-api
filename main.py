@@ -141,6 +141,21 @@ async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/debug/status")
+async def debug_status():
+    import importlib.util
+    anthropic_importable = importlib.util.find_spec("anthropic") is not None
+    supabase_importable  = importlib.util.find_spec("supabase") is not None
+    return {
+        "anthropic_key_set":    bool(ANTHROPIC_API_KEY),
+        "anthropic_key_prefix": ANTHROPIC_API_KEY[:16] + "..." if ANTHROPIC_API_KEY else None,
+        "anthropic_importable": anthropic_importable,
+        "supabase_key_set":     bool(SUPABASE_KEY),
+        "supabase_importable":  supabase_importable,
+        "twilio_sid_set":       bool(TWILIO_ACCOUNT_SID),
+    }
+
+
 # ── SMS inbound (Twilio webhook) ─────────────────────────────────────────────
 
 @app.post("/sms/inbound")
