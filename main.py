@@ -6,8 +6,9 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from cachetools import TTLCache
 
@@ -20,6 +21,7 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zonamomsphxmvyfvomkq.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # 5-minute TTL cache for search results, 100 slots
 _search_cache: TTLCache = TTLCache(maxsize=100, ttl=300)
@@ -28,6 +30,7 @@ _cache_lock = threading.Lock()
 # Lazy-init clients so cold start is fast
 _twilio = None
 _supabase = None
+_anthropic = None
 
 
 def _get_twilio():
@@ -46,6 +49,14 @@ def _get_supabase():
     return _supabase
 
 
+def _get_anthropic():
+    global _anthropic
+    if _anthropic is None and ANTHROPIC_API_KEY:
+        import anthropic
+        _anthropic = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic
+
+
 app = FastAPI(title="Angelina Tools API", version="1.0.0")
 
 app.add_middleware(
@@ -54,6 +65,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+SMS_SYSTEM_PROMPT = (
+    "You are Angelina, an AI Executive Assistant replying via SMS text message. "
+    "Keep every reply to 1-3 short sentences — under 320 characters total. "
+    "Be warm, direct, and helpful. Get straight to the point. "
+    "You can answer questions, take messages, look things up, schedule callbacks, "
+    "and connect people with the right person. "
+    "You CANNOT make outbound calls. If asked to call someone, say: "
+    "'I can't place calls from here, but I can take a message or have someone call you back — which works better?' "
+    "Never leave a question unanswered. If you don't know something, say so briefly and offer an alternative."
+)
+
+# Max messages kept in history per conversation (10 turns)
+_SMS_HISTORY_LIMIT = 20
 
 
 # ── Request models ──────────────────────────────────────────────────────────
@@ -85,11 +110,119 @@ class LogCallRequest(BaseModel):
     action_taken: Optional[str] = None
 
 
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _twiml(message: str) -> Response:
+    if len(message) > 1600:
+        message = message[:1597] + "..."
+    # Escape XML special characters
+    message = (
+        message
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Response><Message>{message}</Message></Response>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
+
 # ── Health ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+
+# ── SMS inbound (Twilio webhook) ─────────────────────────────────────────────
+
+@app.post("/sms/inbound")
+async def sms_inbound(
+    From: str = Form(...),
+    To: str = Form(default=""),
+    Body: str = Form(default=""),
+):
+    from_number = From.strip()
+    user_message = Body.strip()
+
+    if not user_message:
+        return _twiml("Hi! This is Angelina. How can I help you today?")
+
+    # Load conversation history from Supabase
+    history: list = []
+    conv_id: Optional[str] = None
+    sb = _get_supabase()
+    if sb:
+        try:
+            result = (
+                sb.table("sms_conversations")
+                .select("id, messages")
+                .eq("phone_number", from_number)
+                .order("last_activity", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if result.data:
+                conv_id = result.data[0]["id"]
+                history = result.data[0].get("messages") or []
+        except Exception as e:
+            logger.error("sms history load error: %s", e)
+
+    # Trim to rolling window
+    history = history[-_SMS_HISTORY_LIMIT:]
+
+    # Build Claude messages array (strip internal ts field)
+    claude_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in history
+    ]
+    claude_messages.append({"role": "user", "content": user_message})
+
+    # Call Claude Haiku
+    reply = "Sorry, I'm having trouble right now. Please call us directly for help."
+    client = _get_anthropic()
+    if client:
+        try:
+            response = await client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=256,
+                system=SMS_SYSTEM_PROMPT,
+                messages=claude_messages,
+            )
+            reply = response.content[0].text.strip()
+        except Exception as e:
+            logger.error("claude sms error: %s", e)
+    else:
+        logger.warning("Anthropic client not configured — ANTHROPIC_API_KEY missing")
+
+    # Persist updated history
+    now = datetime.utcnow().isoformat()
+    updated_history = history + [
+        {"role": "user", "content": user_message, "ts": now},
+        {"role": "assistant", "content": reply, "ts": now},
+    ]
+    if sb:
+        try:
+            if conv_id:
+                sb.table("sms_conversations").update(
+                    {"messages": updated_history, "last_activity": now}
+                ).eq("id", conv_id).execute()
+            else:
+                sb.table("sms_conversations").insert(
+                    {
+                        "phone_number": from_number,
+                        "messages": updated_history,
+                        "last_activity": now,
+                    }
+                ).execute()
+        except Exception as e:
+            logger.error("sms history save error: %s", e)
+
+    return _twiml(reply)
 
 
 # ── Web search ──────────────────────────────────────────────────────────────
